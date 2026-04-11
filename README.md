@@ -186,9 +186,40 @@ flowchart TD
 
 ## Sample Output
 
-Running `python src/main.py` with the **Late-Night Studier** profile (`lofi / focused`) produces:
+Running `python src/main.py` prints recommendations for all 6 profiles — 3 standard and 3 adversarial edge cases.
 
-![Terminal output showing top 5 recommendations for Late-Night Studier profile](docs/sample_output.png)
+### Standard Profiles
+
+**Profile 1 — Late-Night Studier** (`lofi / focused`)
+
+![Late-Night Studier recommendations](docs/profile1.png)
+
+**Profile 2 — High-Energy Pop** (`pop / intense`)
+
+![High-Energy Pop recommendations](docs/profile2.png)
+
+**Profile 3 — Sunday Wind-Down** (`folk / melancholic`)
+
+![Sunday Wind-Down recommendations](docs/profile3.png)
+
+### Adversarial / Edge-Case Profiles
+
+These profiles are designed to probe weaknesses in the scoring logic.
+
+**Profile 4 — Contradictory** (`blues / sad` + high energy 0.92)
+Tests whether the system handles a user who wants intense energy but a sad mood — two traits that rarely co-exist in the catalog.
+
+![Contradictory profile recommendations](docs/profile4.png)
+
+**Profile 5 — Ghost Profile** (`classical / aggressive`)
+No song in the catalog matches either category. Every song scores 0 on both categorical features, so ranking falls entirely on continuous proximity — reveals the "floor" behavior.
+
+![Ghost profile recommendations](docs/profile5.png)
+
+**Profile 6 — All-Neutral** (`r&b / romantic`, all continuous targets at 0.5)
+Tests whether near-tie continuous scores produce a meaningful ranking or a near-tie jumble.
+
+![All-Neutral profile recommendations](docs/profile6.png)
 
 ```
 ============================================================
@@ -298,11 +329,26 @@ You can add more tests in `tests/test_recommender.py`.
 
 ## Experiments You Tried
 
-Use this section to document the experiments you ran. For example:
+### Experiment 1 — Weight Shift: Halve Genre, Double Energy
 
-- What happened when you changed the weight on genre from 2.0 to 0.5
-- What happened when you added tempo or valence to the score
-- How did your system behave for different types of users
+**Change:** `genre` weight reduced from `2.00` → `1.00`; `energy` weight raised from `1.50` → `3.00`. MAX_SCORE changed from 7.75 to 8.25.
+
+**What happened:**
+- The #1 result did **not change** for any of the 6 profiles. Songs that already matched genre + mood + energy simply pulled further ahead — the experiment made the system more certain, not more varied.
+- Ranks 2–5 did shift. For High-Energy Pop, Storm Runner (rock, wrong genre) climbed to #2 because its energy (0.91) was nearly identical to the target (0.92), earning +2.97 pts. Under the original weights that advantage was only worth +1.47 pts.
+- For the Contradictory profile (blues/sad + high energy), the gap between #1 (Blue Porch Night, correct genre/mood, low energy) and #2 (Iron Cathedral, wrong genre, perfect energy) shrank from ~2 pts to ~0.8 pts — energy was threatening to override the mood match.
+
+**Conclusion:** The change made energy the new dominant feature instead of genre. Rather than fixing the "genre dominance" bias, it just moved the dominance to a different feature. The original balanced weights (genre 2.00, energy 1.50) were reverted because the experiment showed they were better calibrated — no single feature should be able to override everything else.
+
+**Key insight:** In a 20-song catalog, dominance shows up clearly because there is so little competition within each genre. A larger catalog would let the continuous features (energy, valence, tempo) do meaningful tiebreaking *within* genre rather than fighting against it.
+
+### Experiment 2 — Adversarial Profiles
+
+Three edge-case profiles were added to probe system weaknesses:
+
+- **Contradictory** (blues/sad + energy 0.92): Blue Porch Night ranked #1 due to genre+mood match, even though its energy (0.41) was far from the target (0.92). The categorical bonuses (+2.50 pts combined) outweighed the energy penalty, confirming the system prioritizes *taste labels* over *vibe* when they conflict.
+- **Ghost Profile** (classical/aggressive — no catalog match): Iron Cathedral (metal/aggressive) ranked #1 with 6.11/7.75 — surviving entirely on the mood match (+1.50) and near-perfect energy/valence proximity. Shows the system degrades gracefully: no genre match means continuous features decide.
+- **All-Neutral** (r&b/romantic, all targets at 0.5): Velvet Hours ranked #1 by a large margin (6.48 vs 4.65 for #2) purely because it is the only r&b/romantic song. Confirms that in a small catalog, having just one matching song per genre makes the categorical bonus act as an automatic winner.
 
 ---
 

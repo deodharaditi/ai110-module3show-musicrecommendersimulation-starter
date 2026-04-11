@@ -7,25 +7,31 @@ from typing import List, Dict, Tuple
 # ---------------------------------------------------------------------------
 #
 # Each feature contributes a maximum number of points toward a song's total.
-# The maximum possible score is 7.75 points (a perfect match on every feature).
+# The maximum possible score is 9.50 points (a perfect match on every feature).
 #
 # Categorical features (binary match):
 #   Genre  +2.00  — hard taste boundary; mismatches are near-automatic rejections
-#   Mood   +1.50  — strong intent signal; raised from a common 1.0 starter so
-#                   that a correct mood can tip a close genre contest
+#   Mood   +1.50  — strong intent signal; a correct mood can tip a close genre contest
 #
 # Continuous features (proximity scoring):
 #   points = max_points × (1 − |user_target − song_value|)
 #   A score of 1.0 is as valid as 0.0 — closeness is what matters, not magnitude.
 #
-#   Energy          up to +1.50  — most powerful vibe signal (same budget as mood)
+#   Energy          up to +1.50  — most powerful vibe signal
 #   Valence         up to +1.00  — emotional tone: dark vs bright
 #   Tempo           up to +0.75  — activity context: running pace vs study pace
 #   Acousticness    up to +0.50  — texture: organic vs electronic
 #   Speechiness     up to +0.25  — vocal density: sung vs rapped vs instrumental
 #   Instrumentalness up to +0.25 — no-vocals preference; pairs with speechiness
+#   Popularity      up to +0.50  — how well-known the song is
+#   Release decade  up to +0.50  — era preference (1970→0.0 … 2020→1.0)
+#   Liveness        up to +0.25  — studio vs concert-like feel
+#   Loudness        up to +0.25  — quiet vs loud production
 #
-# Max total: 2.00 + 1.50 + 1.50 + 1.00 + 0.75 + 0.50 + 0.25 + 0.25 = 7.75 pts
+# Binary features (match = full points, mismatch = 0):
+#   Explicit        up to +0.25  — explicit content preference
+#
+# Max total: 7.75 + 1.75 = 9.50 pts
 # ---------------------------------------------------------------------------
 _POINTS: Dict[str, float] = {
     "genre":             2.00,
@@ -36,8 +42,87 @@ _POINTS: Dict[str, float] = {
     "acousticness":      0.50,
     "speechiness":       0.25,
     "instrumentalness":  0.25,
+    "popularity":        0.50,
+    "release_decade":    0.50,
+    "liveness":          0.25,
+    "loudness":          0.25,
+    "explicit":          0.25,
 }
-MAX_SCORE: float = sum(_POINTS.values())  # 7.75
+MAX_SCORE: float = sum(_POINTS.values())  # 9.50
+
+# ---------------------------------------------------------------------------
+# Scoring modes — Strategy pattern via plain dicts
+# ---------------------------------------------------------------------------
+# Each mode is a complete weight table that replaces _POINTS for one run.
+# score_song() and recommend_songs() accept an optional `weights` argument;
+# when omitted they fall back to _POINTS (the balanced default).
+#
+# Design rationale: because score_song() already reads weights by key name
+# (e.g. _POINTS["genre"]) rather than hardcoding numbers, swapping the dict
+# is all that is needed to change the strategy — no subclasses, no flags.
+# ---------------------------------------------------------------------------
+
+# Mode 1 — Genre-First: genre is the dominant signal, everything else secondary.
+# Use when: user has a hard genre boundary and wants no surprises.
+SCORING_GENRE_FIRST: Dict[str, float] = {
+    "genre":             4.00,   # doubled — genre match is near-mandatory
+    "mood":              1.50,
+    "energy":            0.75,   # halved — vibe matters less than genre label
+    "valence":           0.50,
+    "tempo":             0.40,
+    "acousticness":      0.25,
+    "speechiness":       0.15,
+    "instrumentalness":  0.15,
+    "popularity":        0.25,
+    "release_decade":    0.25,
+    "liveness":          0.10,
+    "loudness":          0.10,
+    "explicit":          0.15,
+}
+
+# Mode 2 — Vibe-First (energy + valence lead): genre is soft, sound feel dominates.
+# Use when: user wants a specific energy/emotional tone regardless of genre label.
+SCORING_VIBE_FIRST: Dict[str, float] = {
+    "genre":             0.50,   # soft — wrong genre is only a small penalty
+    "mood":              1.00,
+    "energy":            3.50,   # energy is the primary signal
+    "valence":           2.50,   # emotional tone close second
+    "tempo":             1.00,
+    "acousticness":      0.75,
+    "speechiness":       0.25,
+    "instrumentalness":  0.25,
+    "popularity":        0.25,
+    "release_decade":    0.25,
+    "liveness":          0.15,
+    "loudness":          0.30,
+    "explicit":          0.10,
+}
+
+# Mode 3 — Discovery: de-emphasizes popularity so deep cuts surface.
+# Use when: user is tired of the same well-known songs and wants hidden gems.
+SCORING_DISCOVERY: Dict[str, float] = {
+    "genre":             2.00,
+    "mood":              1.50,
+    "energy":            1.50,
+    "valence":           1.00,
+    "tempo":             0.75,
+    "acousticness":      0.50,
+    "speechiness":       0.25,
+    "instrumentalness":  0.25,
+    "popularity":        -0.30,  # negative: penalizes well-known songs
+    "release_decade":    0.75,   # bonus for older eras — surfacing vintage tracks
+    "liveness":          0.25,
+    "loudness":          0.25,
+    "explicit":          0.25,
+}
+
+# Registry — maps string names to weight dicts for easy lookup in main.py
+SCORING_MODES: Dict[str, Dict[str, float]] = {
+    "balanced":    _POINTS,
+    "genre_first": SCORING_GENRE_FIRST,
+    "vibe_first":  SCORING_VIBE_FIRST,
+    "discovery":   SCORING_DISCOVERY,
+}
 
 # BPM normalization range — values outside are clamped, not rejected.
 _BPM_MIN: float = 60.0
@@ -74,6 +159,11 @@ class Song:
     acousticness: float
     speechiness: float = 0.05
     instrumentalness: float = 0.05
+    popularity: int = 50
+    release_decade: int = 2010
+    liveness: float = 0.10
+    loudness_norm: float = 0.50
+    explicit: int = 0
 
 
 @dataclass
@@ -110,6 +200,13 @@ class UserProfile:
     # Stored but not yet weighted (reserved for ranking diversity logic)
     target_danceability: float = 0.60
 
+    # New depth features
+    target_popularity: int = 50
+    target_release_decade: int = 2010
+    target_liveness: float = 0.10
+    target_loudness: float = 0.50
+    prefers_explicit: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Functional API  (used by src/main.py)
@@ -136,50 +233,35 @@ def load_songs(csv_path: str) -> List[Dict]:
                 "acousticness":     float(row["acousticness"]),
                 "speechiness":      float(row["speechiness"]),
                 "instrumentalness": float(row["instrumentalness"]),
+                "popularity":       int(row["popularity"]),
+                "release_decade":   int(row["release_decade"]),
+                "liveness":         float(row["liveness"]),
+                "loudness_norm":    float(row["loudness_norm"]),
+                "explicit":         int(row["explicit"]),
             })
     return songs
 
 
-def score_song(user_prefs: Dict, song: Dict) -> Tuple[float, List[str]]:
-    """
-    Score a single song against a user preference dict using the point recipe.
-
-    Returns (score, reasons) where:
-      score   — total points earned, between 0.0 and MAX_SCORE (7.75)
-      reasons — human-readable explanation of every feature's contribution
-
-    Algorithm Recipe:
-      Categorical features (binary — match = full points, no match = 0):
-        genre match  → +2.00 pts   (hard taste boundary)
-        mood match   → +1.50 pts   (listening intent)
-
-      Continuous features (proximity scoring):
-        earned = max_pts × (1 − |user_target − song_value|)
-        energy           → up to +1.50 pts
-        valence          → up to +1.00 pts
-        tempo (normed)   → up to +0.75 pts
-        acousticness     → up to +0.50 pts
-        speechiness      → up to +0.25 pts
-        instrumentalness → up to +0.25 pts
-
-      tempo_bpm is normalized to [0, 1] via _norm_bpm() before comparison.
-      A value of 0.0 is as valid as 1.0 — closeness to the user's target earns points.
-
-    Required by recommend_songs() and src/main.py
-    """
+def score_song(
+    user_prefs: Dict,
+    song: Dict,
+    weights: Dict[str, float] = None,
+) -> Tuple[float, List[str]]:
+    """Score a single song using the given weight table (defaults to _POINTS)."""
+    w = weights if weights is not None else _POINTS
     score = 0.0
     reasons: List[str] = []
 
     # --- Categorical features (binary: match = full points, else 0) ---
     if song["genre"] == user_prefs["genre"]:
-        score += _POINTS["genre"]
-        reasons.append(f"genre match ({song['genre']}) +{_POINTS['genre']:.2f}pts")
+        score += w["genre"]
+        reasons.append(f"genre match ({song['genre']}) +{w['genre']:.2f}pts")
     else:
         reasons.append(f"genre mismatch ({song['genre']} ≠ {user_prefs['genre']}) +0.00pts")
 
     if song["mood"] == user_prefs["mood"]:
-        score += _POINTS["mood"]
-        reasons.append(f"mood match ({song['mood']}) +{_POINTS['mood']:.2f}pts")
+        score += w["mood"]
+        reasons.append(f"mood match ({song['mood']}) +{w['mood']:.2f}pts")
     else:
         reasons.append(f"mood mismatch ({song['mood']} ≠ {user_prefs['mood']}) +0.00pts")
 
@@ -188,12 +270,18 @@ def score_song(user_prefs: Dict, song: Dict) -> Tuple[float, List[str]]:
     song_tempo_norm = _norm_bpm(song["tempo_bpm"])
 
     continuous = [
-        ("energy",           user_prefs["target_energy"],                   song["energy"],            _POINTS["energy"]),
-        ("valence",          user_prefs["target_valence"],                   song["valence"],           _POINTS["valence"]),
-        ("tempo",            user_tempo_norm,                                song_tempo_norm,           _POINTS["tempo"]),
-        ("acousticness",     user_prefs["target_acousticness"],              song["acousticness"],      _POINTS["acousticness"]),
-        ("speechiness",      user_prefs.get("target_speechiness",    0.05),  song["speechiness"],       _POINTS["speechiness"]),
-        ("instrumentalness", user_prefs.get("target_instrumentalness",0.05), song["instrumentalness"],  _POINTS["instrumentalness"]),
+        ("energy",           user_prefs["target_energy"],                   song["energy"],            w["energy"]),
+        ("valence",          user_prefs["target_valence"],                   song["valence"],           w["valence"]),
+        ("tempo",            user_tempo_norm,                                song_tempo_norm,           w["tempo"]),
+        ("acousticness",     user_prefs["target_acousticness"],              song["acousticness"],      w["acousticness"]),
+        ("speechiness",      user_prefs.get("target_speechiness",    0.05),  song["speechiness"],       w["speechiness"]),
+        ("instrumentalness", user_prefs.get("target_instrumentalness",0.05), song["instrumentalness"],  w["instrumentalness"]),
+        ("popularity",       user_prefs.get("target_popularity",     50) / 100,
+                             song.get("popularity", 50) / 100,              w["popularity"]),
+        ("release_decade",   (user_prefs.get("target_release_decade", 2010) - 1970) / 50,
+                             (song.get("release_decade", 2010) - 1970) / 50, w["release_decade"]),
+        ("liveness",         user_prefs.get("target_liveness",       0.10),  song.get("liveness",       0.10), w["liveness"]),
+        ("loudness",         user_prefs.get("target_loudness",       0.50),  song.get("loudness_norm",  0.50), w["loudness"]),
     ]
 
     for name, user_val, song_val, max_pts in continuous:
@@ -204,25 +292,85 @@ def score_song(user_prefs: Dict, song: Dict) -> Tuple[float, List[str]]:
             f"{name}: song={song_val:.2f}, target={user_val:.2f} → +{earned:.2f}pts"
         )
 
+    # --- Explicit content (binary match) ---
+    song_explicit = song.get("explicit", 0)
+    user_explicit = user_prefs.get("prefers_explicit", 0)
+    if song_explicit == user_explicit:
+        score += w["explicit"]
+        reasons.append(f"explicit match ({song_explicit}) +{w['explicit']:.2f}pts")
+    else:
+        reasons.append(
+            f"explicit mismatch (song={song_explicit}, prefers={user_explicit}) +0.00pts"
+        )
+
     return round(score, 3), reasons
 
 
-def recommend_songs(user_prefs: Dict, songs: List[Dict], k: int = 5) -> List[Tuple[Dict, float, str]]:
-    """
-    Score every song, sort by score descending, return the top k.
-    Each item in the returned list is (song_dict, score, explanation).
-    Required by src/main.py
+def recommend_songs(
+    user_prefs: Dict,
+    songs: List[Dict],
+    k: int = 5,
+    weights: Dict[str, float] = None,
+    artist_penalty: float = 0.0,
+    genre_penalty: float = 0.0,
+) -> List[Tuple[Dict, float, str]]:
+    """Score every song with the given weights, apply diversity penalties, return top k.
+
+    Diversity penalty (greedy re-ranking):
+      At each selection step, subtract `artist_penalty` from any candidate whose
+      artist already appears in the selected list, and subtract `genre_penalty`
+      from any candidate whose genre already appears. The candidate with the
+      highest adjusted score is chosen, then added to the seen sets.
+      Set both penalties to 0.0 (default) to disable and use plain score ranking.
     """
     scored = [
-        (song, *score_song(user_prefs, song))
+        (song, *score_song(user_prefs, song, weights))
         for song in songs
     ]
     scored.sort(key=lambda x: x[1], reverse=True)
-    # Flatten reasons list into a single explanation string
-    return [
-        (song, score, "; ".join(reasons) if reasons else "no strong feature matches")
-        for song, score, reasons in scored[:k]
-    ]
+
+    if artist_penalty == 0.0 and genre_penalty == 0.0:
+        return [
+            (song, score, "; ".join(reasons) if reasons else "no strong feature matches")
+            for song, score, reasons in scored[:k]
+        ]
+
+    # Greedy MMR-style diversity selection
+    selected: List[Tuple[Dict, float, str]] = []
+    seen_artists: set = set()
+    seen_genres: set = set()
+    remaining = list(scored)
+
+    while len(selected) < k and remaining:
+        # Re-score remaining candidates with current penalties
+        adjusted = []
+        for song, base_score, reasons in remaining:
+            penalty = 0.0
+            penalty_parts = list(reasons)
+            if song["artist"] in seen_artists:
+                penalty += artist_penalty
+                penalty_parts.append(
+                    f"artist repeat ({song['artist']}) -{artist_penalty:.2f}pts"
+                )
+            if song["genre"] in seen_genres:
+                penalty += genre_penalty
+                penalty_parts.append(
+                    f"genre repeat ({song['genre']}) -{genre_penalty:.2f}pts"
+                )
+            adjusted.append((song, base_score - penalty, penalty_parts))
+
+        adjusted.sort(key=lambda x: x[1], reverse=True)
+        best_song, best_score, best_reasons = adjusted[0]
+        selected.append((
+            best_song,
+            best_score,
+            "; ".join(best_reasons) if best_reasons else "no strong feature matches",
+        ))
+        seen_artists.add(best_song["artist"])
+        seen_genres.add(best_song["genre"])
+        remaining = [(s, sc, r) for s, sc, r in remaining if s["id"] != best_song["id"]]
+
+    return selected
 
 
 # ---------------------------------------------------------------------------
@@ -240,20 +388,30 @@ def _song_to_dict(song: Song) -> Dict:
         "acousticness":     song.acousticness,
         "speechiness":      song.speechiness,
         "instrumentalness": song.instrumentalness,
+        "popularity":       song.popularity,
+        "release_decade":   song.release_decade,
+        "liveness":         song.liveness,
+        "loudness_norm":    song.loudness_norm,
+        "explicit":         song.explicit,
     }
 
 
 def _profile_to_dict(user: UserProfile) -> Dict:
     """Convert a UserProfile dataclass into the flat dict expected by score_song()."""
     return {
-        "genre":                  user.favorite_genre,
-        "mood":                   user.favorite_mood,
-        "target_energy":          user.target_energy,
-        "target_valence":         user.target_valence,
-        "target_tempo_bpm":       user.target_tempo_bpm,
-        "target_acousticness":    user.target_acousticness,
-        "target_speechiness":     user.target_speechiness,
-        "target_instrumentalness":user.target_instrumentalness,
+        "genre":                   user.favorite_genre,
+        "mood":                    user.favorite_mood,
+        "target_energy":           user.target_energy,
+        "target_valence":          user.target_valence,
+        "target_tempo_bpm":        user.target_tempo_bpm,
+        "target_acousticness":     user.target_acousticness,
+        "target_speechiness":      user.target_speechiness,
+        "target_instrumentalness": user.target_instrumentalness,
+        "target_popularity":       user.target_popularity,
+        "target_release_decade":   user.target_release_decade,
+        "target_liveness":         user.target_liveness,
+        "target_loudness":         user.target_loudness,
+        "prefers_explicit":        user.prefers_explicit,
     }
 
 
